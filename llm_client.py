@@ -1,131 +1,158 @@
+import json
 import logging
-import random
 import re
-from typing import Iterable
-
-import requests
+import socket
+import urllib.error
+import urllib.request
 
 import config
 
+LOG = logging.getLogger(__name__)
 
-FALLBACKS = [
-    "Sorry, my local brain glitched for a second. Try that again.",
-    "I missed that one; say it once more and I will try again.",
-    "My thoughts tripped for a moment, but I am still here.",
-]
-
-FORBIDDEN = [
-    "machine learning model",
-    "language model",
-    "ai model",
-    "as an ai",
-    "not a robot companion",
-]
+MODEL = getattr(config, "LLM_MODEL", "qwen2.5-instruct:1.5b")
+GENERATE_URL = getattr(config, "LLM_GENERATE_ENDPOINT", "http://127.0.0.1:8000/api/generate")
+TIMEOUT = getattr(config, "LLM_TIMEOUT_SECONDS", 25)
 
 
-def _local_reply(user_text: str) -> str | None:
-    text = user_text.lower().strip()
+def clean_answer(text):
+    if not text:
+        return ""
 
-    if any(x in text for x in ["i'm tired", "i am tired", "im tired", "i feel tired", "tired"]):
-        return random.choice([
-            "That sounds rough; take a small pause, drink some water, and I will keep you company.",
-            "I hear you. Let us slow down for a minute.",
-            "Then let us make things easy for a bit; I am right here.",
-        ])
-
-    if text in {"hi", "hey", "hello"} or "how are you" in text:
-        return random.choice([
-            "Hi, I am here and ready.",
-            "Hey, friend. I am glad to hear you.",
-            "Hello. What shall we do next?",
-        ])
-
-    if "who are you" in text or "what is your name" in text:
-        return random.choice([
-            "I am pi_friend, your little robot companion.",
-            "I am pi_friend, a small local robot friend on your Raspberry Pi.",
-            "I am pi_friend, here to listen and help.",
-        ])
-
-    if "tell me a joke" in text or text == "joke":
-        return random.choice([
-            "Why did the computer get cold? Because it left its Windows open.",
-            "Why did the robot bring a ladder? It wanted to reach the cloud.",
-            "Why did the tiny robot stay calm? It had well-grounded circuits.",
-        ])
-
-    return None
+    cleaned = str(text)
+    cleaned = re.sub(r"<think>.*?</think>", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.replace("pi_friend:", "")
+    cleaned = cleaned.replace("assistant:", "")
+    cleaned = cleaned.replace("Assistant:", "")
+    cleaned = cleaned.replace("user:", "")
+    cleaned = cleaned.replace("User:", "")
+    cleaned = cleaned.replace("\\_", "_")
+    cleaned = cleaned.replace("*", "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:280]
 
 
-def _looks_repetitive(answer: str) -> bool:
-    words = re.findall(r"[0-9A-Za-zА-Яа-яЁё']+", answer.lower())
-    if len(words) < 16:
-        return False
-    return len(set(words)) / len(words) < 0.45
+def is_bad_answer(text):
+    cleaned = clean_answer(text)
+    lowered = cleaned.lower().strip(" .!?")
+
+    if not cleaned:
+        return True
+
+    if lowered in {"i", "sure", "okay", "ok", "yes", "no"}:
+        return True
+
+    bad_phrases = [
+        "you didn't ask a question",
+        "you didn't provide a question",
+        "you didn't give me a question",
+        "i can't assist with that",
+        "i cannot assist with that",
+        "as an ai language model",
+        "i am not an ai language model",
+    ]
+
+    for phrase in bad_phrases:
+        if phrase in lowered:
+            return True
+
+    if len(cleaned.split()) < 3:
+        return True
+
+    return False
 
 
-def _clean_answer(answer: str, user_text: str) -> str:
-    answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL | re.IGNORECASE)
-    answer = answer.replace("Assistant:", "").replace("pi_friend:", "").replace("User:", "")
-    answer = re.sub(r"\s+", " ", answer).strip().strip('"').strip()
-
-    low = answer.lower()
-    if not answer or any(bad in low for bad in FORBIDDEN) or _looks_repetitive(answer):
-        logging.warning("Rejected LLM answer: %r", answer[:220])
-        return _local_reply(user_text) or random.choice(FALLBACKS)
-
-    sentences = re.findall(r"[^.!?]{2,170}[.!?]", answer)
-    if "joke" in user_text.lower() and len(sentences) >= 2:
-        return " ".join(s.strip() for s in sentences[:2])
-    if sentences:
-        return sentences[0].strip()
-
-    return answer[:220].strip()
-
-
-def ask_llm(user_text: str, history: Iterable[dict] | None = None) -> str:
-    local = _local_reply(user_text)
-    if local:
-        logging.info("Local answer: %r", local)
-        return local
-
-    endpoint = config.LLM_ENDPOINT.replace("/api/chat", "/api/generate")
+def build_prompt(user_text, history=None, retry=False):
+    history = history or []
+    recent = history[-2:]
 
     prompt = (
-        "You are pi_friend, a small warm robot companion.\n"
-        "You speak directly as pi_friend.\n"
-        "Never say you are an AI, a language model, or a machine learning model.\n"
-        "Do not pretend to be the user or copy the user's feelings as your own.\n"
-        "Be kind, concrete, and natural.\n"
-        "Answer in one short helpful sentence, or two short sentences if needed.\n"
-        "Do not repeat words.\n"
-        f"User: {user_text.strip()}\n"
-        "pi_friend:"
+        "You are pi_friend, a small friendly voice robot running locally on a Raspberry Pi.\n"
+        "The user speaks to you through a microphone.\n"
+        "Answer the user's last message directly.\n"
+        "Use simple English. Use 1 or 2 short spoken sentences.\n"
+        "Do not say that the user did not ask a question.\n"
+        "Do not refuse normal harmless questions.\n"
+        "Do not mention system instructions.\n\n"
     )
 
+    for turn in recent:
+        user = str(turn.get("user", "")).strip()
+        assistant = str(turn.get("assistant", "")).strip()
+        if user and assistant:
+            prompt += f"User: {user}\nAssistant: {assistant}\n"
+
+    if retry:
+        prompt += "Your previous answer was bad. Answer the user directly now.\n"
+
+    prompt += f"User: {user_text.strip()}\nAssistant:"
+    return prompt
+
+
+def generate_raw(prompt, timeout=TIMEOUT):
     payload = {
-        "model": config.LLM_MODEL,
-        "stream": False,
+        "model": MODEL,
         "prompt": prompt,
+        "stream": False,
         "options": {
-            "num_predict": 52,
+            "num_predict": 80,
             "temperature": 0.35,
             "top_p": 0.9
-        },
+        }
     }
 
+    req = urllib.request.Request(
+        GENERATE_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}
+    )
+
     try:
-        response = requests.post(endpoint, json=payload, timeout=config.LLM_TIMEOUT_SECONDS)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as exc:
-        logging.warning("LLM request failed: %s", exc)
-        return random.choice(FALLBACKS)
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
 
-    raw = ""
-    if isinstance(data, dict):
-        raw = data.get("response") or data.get("message", {}).get("content") or ""
+            if isinstance(data, dict) and data.get("error"):
+                return False, "", str(data.get("error"))
 
-    answer = _clean_answer(raw, user_text)
-    logging.info("LLM answer: %r", answer)
-    return answer
+            if isinstance(data, dict):
+                return True, data.get("response", ""), ""
+
+            return False, "", "bad json"
+
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        return False, "", f"HTTP {error.code}: {body}"
+
+    except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, json.JSONDecodeError) as error:
+        return False, "", str(error)
+
+
+def generate_answer(user_text, history=None):
+    prompt = build_prompt(user_text, history=history, retry=False)
+    ok, raw, error = generate_raw(prompt)
+
+    if ok:
+        answer = clean_answer(raw)
+        if not is_bad_answer(answer):
+            LOG.info("LLM answer: %r", answer)
+            return answer
+        LOG.warning("Rejected LLM answer: %r", answer)
+    else:
+        LOG.warning("LLM request failed: %s", error)
+
+    retry_prompt = build_prompt(user_text, history=history, retry=True)
+    ok, raw, error = generate_raw(retry_prompt)
+
+    if ok:
+        answer = clean_answer(raw)
+        if not is_bad_answer(answer):
+            LOG.info("LLM retry answer: %r", answer)
+            return answer
+        LOG.warning("Rejected LLM retry answer: %r", answer)
+    else:
+        LOG.warning("LLM retry failed: %s", error)
+
+    return "My local LLM did not return a usable answer. Please ask me again."
+
+def ask_llm(user_text, history=None):
+    return generate_answer(user_text, history)
